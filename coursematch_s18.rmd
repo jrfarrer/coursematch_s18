@@ -1,0 +1,668 @@
+---
+title: "CourseMatch Metrics - Spring 2018"
+subtitle: "Data Processing for Google Sheet"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  bookdown::html_document2:
+    css: css/analysis.css
+    code_folding: hide
+    df_print: paged
+    number_sections: yes
+    self-contained: true
+    fig_caption: yes
+    toc: true
+    toc_float: true
+params:
+  external_queries: false
+---
+
+```{r setup, include = FALSE}
+# knitr options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = 'center',
+                      fig.width = 9, fig.height = 8, cache = FALSE)
+
+# Forces any incline R to only have 2 digits and a comma for the thounsands place
+knitr::knit_hooks$set(inline = function(x) {if(!is.numeric(x)){ x }else{ prettyNum(round(x,2), big.mark=",") } })
+
+# Don't show scientific notation and only 3 digits
+options(scipen = 999, digits = 3)
+
+# Load packages
+pacman::p_load(tidyverse, readxl, stringr, lubridate, googlesheets, rvest, forcats, 
+               grid, gridExtra, htmlTable, highcharter)
+
+# Token to connect to Googlespreadsheets
+suppressMessages(gs_auth(token = "googlesheets_token.rds", verbose = FALSE))
+
+# Create folder structure
+data_path <- "data/"; viz_path <- "viz/"
+purrr::walk(c(data_path, viz_path), dir.create, showWarnings = FALSE)
+
+#Set ggplot theme
+ggplot2::theme_set(theme_minimal() + 
+          theme(legend.position="top", plot.caption = element_text(size = 8), 
+                panel.grid.minor.x = element_blank(), 
+                strip.background = element_rect(fill = "grey85", colour = "grey85"),
+                legend.margin=margin(t = -0.3, r = 0, b = -0.4, l=0, unit="cm")))
+
+wharton_col <- c("#004785", "#A90533", "#A262460", "#282F85", "#026CB5", "#06AAFC",
+                 "#532A85","#96227D", "#A8204E","#C5093B","#2D2C41","#D7BC6A",
+                 "#B2B6A7","EEEDEA")
+names(wharton_col) <- c("wharton_blue", 'wharton_red','midnight_blue','atlantic_blue','pacific_blue','bay_blue',
+                        'evening_red','sunset_red','brick_red','heritage_red','night_street','morning_yellow',
+                        'college_grey','marine_grey')
+
+hcoptslang <- getOption("highcharter.lang")
+hcoptslang$thousandsSep <- ","
+hcoptslang$numericSymbols <- c("k", "M", "B", "T", "P", "E")
+options(highcharter.lang = hcoptslang)
+```
+
+## tl;dr
+
+1. This notebook documents how we built the [Google Sheet](https://docs.google.com/a/wharton.upenn.edu/spreadsheets/d/1kFKaK7KXlvA3zUTQvFvwZNkc7F5iZ51rKo9lC3AcXwY/edit?usp=sharing) with course and instructor evaluations and clearing prices
+2. It's basically a replica of [the previous how-we-built-this](http://bit.ly/coursematch_howwebuilt)
+3. There some basic exploratory plots at the end
+
+# Disclaimer
+
+**Course Evaluations have been shown to be worthless**
+
+Read:
+
+1. Academic Paper: [*Meta-analysis of faculty's teaching effectiveness: Student evaluation of teaching ratings and student learning are not related*](http://www.sciencedirect.com/science/article/pii/S0191491X16300323)
+2. Slate Article: [*Student Evaluations of College Professors are Biased and Worthless*](http://www.slate.com/articles/life/education/2014/04/student_evaluations_of_college_professors_are_biased_and_worthless.html)
+
+We put this together because Analytics Club member like this and we are interested to see what flawed data shows us. But remember:
+
+<div class = "meme_img">
+```{r gonna_have_a_bad_time}
+knitr::include_graphics(paste0(viz_path, "gonna_have_a_bad_time.jpg"))
+```
+</div>
+
+# Data Acquisition
+
+<div class="tbl75">
+|Data|Description|Source|
+|---|----------|--------|
+|CourseMatch Sections|Actual sections we can place utility on|Download html from CourseMatch and extract the sections from the table|
+|Course Information|Details such as time, number of CUs, professor, etc.|Download html from CourseMatch and extract the sections from the table|
+|Course Evaluations|Couse evaluations from Spring 2016 to Fall 2017 (only Q1)|Export from Spike|
+|Clearing Prices|Historical price of sections|Combined xlsx files from mba-inside.wharton.upenn.com|
+</div>
+
+## CourseMatch Sections
+
+To get all sections listed in CourseMatch, we extract the table from the html. Some courses are cross-listed and we create a column to include the other sections a course can be listed as. 
+
+```{r parse-coursematch-html}
+# List of sections available for selection within CourseMatch
+coursematch_sections <- 
+  read_html(paste0(data_path, "Course Match.html")) %>%
+  html_node(xpath = '//*[@id="preferences-table"]') %>%
+  html_table(header = TRUE, trim = TRUE) %>%
+  repair_names() %>%
+  as_tibble() %>%
+  select(1) %>%
+  rename_at(vars(contains("Dept")), funs(paste0("Course_Multiple"))) %>%
+  mutate(Section = str_extract_all(Course_Multiple, "[A-Z]{4}[0-9]{6}")) %>%
+  unnest() %>%
+  mutate(cross_listed_as = str_replace(Course_Multiple, Section, "")) %>%
+  mutate(cross_listed_as = if_else(cross_listed_as == "", NA_character_, cross_listed_as)) %>%
+  distinct(Section, cross_listed_as) %>%
+  rowwise() %>%
+  mutate(cross_listed_as = if_else(cross_listed_as == "", NA_character_, 
+                                   paste0(str_extract_all(cross_listed_as, 
+                          "[A-Z]{4}[0-9]{6}", simplify = TRUE), collapse = ","))) %>%
+  ungroup()
+```
+
+```{r show-tbl-coursematch-sections, echo = FALSE}
+coursematch_sections
+```
+
+## Course Information
+
+To get all the information about the Fall 2017 courses, we can use the *export* feature on [Spike](https://spike.wharton.upenn.edu/courses/index.cfm?method=search_courses). Unfortunately, this contains non-MBA classes too (ungraad and PhD). Below we are just showing the top 20 rows.
+
+```{r load-all-wharton-courses}
+spring_2018_courses <- 
+  readxl::read_excel(paste0(data_path, "export_courses.xls")) #%>%
+  # For some reason, Corporate Restucturing and Distress Investing is listed as 
+  # FNCE891401 on Spike but FNCE891001 on CourseMatch - fixing this so
+  # that everything matches
+  # mutate(Section = str_replace(Section, "FNCE891401","FNCE891001"))
+```
+
+```{r show-all-wharton-courses, echo = FALSE}
+spring_2018_courses %>% head(20)
+```
+
+## Course Evaluations
+
+Course evaluation comes from a [Spike export](https://spike.wharton.upenn.edu/courses/?method=export_evaluations). You need to open the Excel file and resave before it will load into R (see documented issue caused by the way this file was built by Spike). 
+
+```{r load-course-eval-data}
+course_eval <- 
+  readxl::read_excel(paste0(data_path, "CourseEvaluationData.xls"), skip = 1) %>% 
+  filter(n() != row_number())
+```
+
+```{r show-course-eval-raw-data, echo = FALSE}
+course_eval %>% head(20)
+```
+
+## Clearing Prices
+
+Clearing price data comes the **public** [MBA Inside website](https://mba-inside.wharton.upenn.edu/course-match/). We loop over the page, download, and combine each of the xlsx files. 
+
+```{r download-clearing-prices}
+base_url <- "https://mba-inside.wharton.upenn.edu/course-match/"
+
+# Read in the base url, find all the links, extract
+# the ones that contain xlsx and then download each
+# one giving it the proper name
+if (params$external_queries) {
+  read_html(base_url) %>%
+    html_nodes('a') %>%
+    html_attr("href") %>%
+    as_tibble() %>%
+    filter(str_detect(value, "xlsx")) %>%
+    mutate(file_name = basename(value)) %>%
+    mutate(a = walk2(value, paste0(data_path, "clearing_prices/", file_name), download.file, mode = "wb"))
+}
+
+# Function to load each xlsx file of clearing prices
+# Need to have a switch because the Fall 2013 file
+# contains an extra row at the top
+fn_load_clearing_price_xlsx <- function(file_name) {
+  if (str_detect(file_name, "13")) {
+    readxl::read_excel(file_name, skip = 1)
+  } else {
+    readxl::read_excel(file_name, skip = 0)
+  }
+}
+
+# Function to rename the columns that 
+# look like 'section' and 'price' to Section
+# and Price so that they can be binded
+fn_rename_at <- function(df, string) {
+  df %>%
+    rename_at(vars(matches(string)), funs(paste0(string)))
+}
+
+# Load and coalesce each of the clearing price
+# Excel files
+clearing_prices <- 
+  list.files(paste0(data_path, "clearing_prices/"), full.names = TRUE) %>%
+  map(fn_load_clearing_price_xlsx) %>%
+  map(select, matches("Section|Price")) %>%
+  map(fn_rename_at, string = "Section") %>%
+  map(fn_rename_at, string = "Price") %>%
+  bind_rows() %>%
+  mutate(Course = str_sub(Section, 1, 7)) %>%
+  select(Course, Section, Price)
+```
+
+```{r show-head-of-clearing-price-data, echo = FALSE}
+clearing_prices
+```
+
+# Data Cleaning
+
+After acquiring data from the four data sources we need to do some combining and cleaning.
+
+```{r spring_2018}
+spring_2018 <- 
+  spring_2018_courses %>%
+  select(-Max, -Status) %>%
+  distinct() %>%
+  mutate(Section = strsplit(as.character(Section), " / ")) %>% 
+  unnest(Section) %>%
+  select(Section, everything()) %>%
+  inner_join(coursematch_sections, by = "Section") %>%
+  mutate(title_length = length(Title)) %>%
+  arrange(Section, desc(title_length)) %>%
+  group_by(Section) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  mutate(
+    Course = str_sub(Section, 1, 7)
+    , Section = str_sub(Section, 8, 10)
+    , CU = as.numeric(CU)
+  ) %>%
+  select(Course, Section, Title, Instructor, CU, Dates, `Day(s)`, cross_listed_as) %>%
+  separate(Dates, c("start_date", "end_date"), sep = "-") %>%
+  mutate(
+      start_date = lubridate::mdy(start_date)
+    , Days = stringr::str_extract(`Day(s)`, "^([\\w]+)")
+    , Quarter = if_else(CU == 1, "Full", if_else(lubridate::month(start_date) == 8, "Q1", "Q2"))
+    , start_time = stringr::str_extract(`Day(s)`, "(?:\\S+){2}(\\S+)")
+    , end_time = str_trim(stringr::str_extract(`Day(s)`, "\\s(\\S+)$"))
+    , Title = str_to_title(Title)
+  ) %>%
+  select(-start_date, -end_date, -`Day(s)`) %>% 
+  filter(str_sub(Course, 1, 4) != "WHCP")
+```
+
+We first create a table that contains all the sections that are available on CourseMatch and the useful information about the section: title, instructor, CU, quarter, time, etc.
+
+```{r show_spring_2018, echo = FALSE}
+spring_2018 %>% 
+  sample_n(10) %>% 
+  select(-cross_listed_as) %>%
+  #select(-one_of('cross_listed_as'), one_of('cross_listed_as')) %>%
+  htmlTable(
+      rnames = FALSE
+    , caption = "10 sample rows from of cleaned information about the courses listed in CourseMatch"
+    , css.cell = "padding-left: .5em; padding-right: .5em;"
+    , header = c('Course','Section','Title','Instructor','CU','Days','Quarter','Start Time','End Time')
+    , align = c("ccllccccrr")
+    , col.rgroup = c("none", "#F7F7F7")
+  ) #%>% htmltools::html_print()
+```
+
+```{r tbl_questions}
+tbl_questions <- tribble(
+   ~question_type, ~question, ~question_abbr
+   , 'Course', 'Overall Quality of Course (0=worst 4=best)', 'Course Quality'
+   , 'Course', 'Value of Assigned Readings (0=worst 4=best)', 'Value of Assigned Readings'
+   , 'Course', 'Learned from this Course in terms of Knowledge / Concepts / Skills / Thinking Ability (0=worst 4=best)', 'Amount Learned'
+   , 'Course', 'Rate the Difficulty of this Course (0=easiest 4=hardest)', 'Difficulty'
+   , 'Course', 'Rate the Amount of Work Required for this Course (0=easiest 4=hardest)', 'Amount of Work Required'
+   , 'Course', 'Would you Recommend this Course to a Major? (4=most strongly)', 'Recommend to Major?'
+   , 'Course', 'Would you Recommend this Course to a Non-Major? (4=most strongly)', 'Recommend to Non-Major'
+   , 'Instructor', 'Overall Quality of Instructor (0=worst 4=best)', 'Instructor Quality'
+   , 'Instructor', 'Instructor Ability to Communicate Subject Matter (0=worst 4=best)', 'Ability to Communicate Subject Matter'
+   , 'Instructor',  'Instructor Ability to Stimulate Student Interest (0=worst 4=best)', 'Ability to Stimulate Interest'
+   , 'Instructor', 'Instructor Accessibility / Willingness to Discuss Course Content / Problems (0=worst 4=best)', 'Instructor Accessibility'  
+) %>%
+  mutate(
+    question_type = fct_inorder(question_type)
+    , question_abbr = fct_inorder(question_abbr)
+  )
+```
+
+```{r tbl_course_lookup}
+tbl_course_lookup <-
+  tribble(
+    ~evaluated_course, ~coursematch_course,
+    #'ACCT208',	'ACCT718', 
+    'BEPP201',	'BEPP770', # Taught Spring 2018
+    'BEPP305',	'BEPP805', # Taught Spring 2018
+    #'STAT451',	'BEPP851',
+    #'STAT453',	'BEPP853',
+    #'REAL721',	'FNCE721',
+    #'OIDD693',	'LGST693',
+    #'LGST809',	'MGMT815',
+    #'OIDD415',	'OIDD515', 
+    #'STAT470',	'STAT770', 
+    #'STAT451',	'STAT851',
+    'STAT453',	'STAT853',
+    NA_character_, 'MGMT833', # Taught Spring 2018
+    #NA_character_, 'LGST641',
+    'OIDD691', 'MGMT691',  # Negotiations
+    'LGST806', 'MGMT691',  # Negotiations
+    'BEPP289', 'BEPP789',  # NATIONS, POL AND MARKETS
+    'OIDD261', 'BEPP761',  # Risk Analysis and Environmental Management
+    'LGST202', 'LGST802',  # Law of Corp Mgmt & Fnce
+    'LGST220', 'LGST820',  # Int'l Bus Ethics
+    'LGST215', 'LGST815',  # Envt'l Mgmt Law & Pol
+    'MKTG224', 'MKTG724',  # Advertisting Management
+    'OIDD397', 'OIDD697',  # Retail Supply Chain Mgmt
+    'OIDD261', 'OIDD761',  # Risk Analy & Evn Mgmt
+    'REAL215', 'REAL724',  # Urban Real Estate Econ 
+    'MKTG212', 'MKTG712'   # Data and Analysis for Marketing Decisions
+  )
+```
+
+```{r cross_listed_course}
+# coursematch_sections %>% filter(!is.na(cross_listed_as)) %>% mutate(Course = str_sub(Section, 1, 7), CL = str_sub(cross_listed_as, 1, 7)) %>% distinct(Course, CL) %>% View()
+cross_listed_course <- 
+  tribble(
+      ~coursematch, ~evaluated_as
+      , "BEPP708", "REAL708" # Housing Markets
+      , "OIDD763", "BEPP763" # Energy Markets and Policy
+      , "FNCE721", "REAL721" # Real Estate Investments
+      , "LGST692", "OIDD692" # Advanced Topics in Negotiations
+      , "LGST804", "REAL804" # Real Estate Law
+      , "LGST806", "MGMT691" # Negotiations 
+      , "MGMT815", "LGST809" # Sports Business Mgmt
+      , "MGMT692", "OIDD692" # Advanced Topics in Negotiations        
+      , "STAT776", "MKTG776" # Applied Probablistic Models in Marketing
+      , "OIDD691", "MGMT691" # Negotiations 
+      , "MGMT690", "OIDD690" # Managerial Decisn Making -- Not Taught Spring 2018
+      , "LGST693", "OIDD693" # Influence                -- Not Taught Spring 2018
+    )
+```
+
+Then we clean the course evaluation data so that it can be aggregated. Here are 10 sample rows:
+
+```{r course_eval_cleaned}
+course_eval_cleaned <- 
+  course_eval %>%
+  gather(question, value, -Term, -Section, -Title, -Instructor) %>%
+  left_join(tbl_questions, by = 'question') %>%
+  select(-question) %>%
+  mutate(
+      Year = str_sub(Term, 1,4)
+    , Course = str_sub(Section, 1, 7)
+  ) %>%
+  left_join(tbl_course_lookup, by = c('Course' = 'evaluated_course')) %>%
+  mutate(Course = if_else(is.na(coursematch_course), Course, coursematch_course)) %>%
+  mutate(
+    Course_Num = str_sub(Course, 5, 7)
+    , Dept = str_sub(Course, 1, 4)
+  ) %>%
+  select(Year, Dept, Course_Num, Course, Section, Title, Instructor, question_type, question_abbr, value) %>%
+  filter((Course_Num >= 600 & Course_Num < 900) & str_sub(Course, 1, 4) != "WHCP")
+```
+
+```{r show_course_eval_cleaned, echo = FALSE}
+course_eval_cleaned %>% 
+  sample_n(10) %>% 
+  htmlTable(
+      rnames = FALSE
+    , caption = "10 sample rows from the tidied course evaluation data"
+    , css.cell = "padding-left: .5em; padding-right: .5em;"
+    , header = c('Year','Dept','Course Number','Course','Section','Title','Instructor','Question Type', 'Question', "Value")
+    , align = c("cccccllclr")
+    , col.rgroup = c("none", "#F7F7F7")
+  ) #%>% htmltools::html_print()
+```
+
+# Summaries for Google Sheet
+
+With the course evaluation that Wharton provides we can present that data at two levels of detail:
+
+1. **Course View**: Aggregate the reviews for all sections a course was taught
+2. **Instructor View**: Aggregate the reviews for all sections an instructor has taught
+
+We also create both tables and "benchmark" that uses all historical data (not just the courses that will be taught in Spring 2018).
+
+## Course View
+
+```{r course_metrics}
+course_metrics <- 
+  spring_2018 %>%
+  left_join(cross_listed_course, by = c('Course' = 'coursematch')) %>% 
+  mutate(evaluated_as = if_else(is.na(evaluated_as), Course, evaluated_as)) %>%
+  left_join(
+    course_eval_cleaned %>%
+    filter(question_type == "Course") %>%
+    group_by(Course, question_abbr) %>%
+    summarise(
+      value = mean(value)
+      , sections_evaluated = n()
+    ) %>%
+    spread(question_abbr, value)
+    , by = c('evaluated_as' = 'Course')
+  ) %>%
+  left_join(
+    clearing_prices %>%
+      filter(str_sub(Course, 1, 4) != "WHCP") %>%
+      mutate(Course = str_replace(Course, "OPIM", "OIDD")) %>%
+      left_join(cross_listed_course, by = c('Course' = 'coursematch')) %>%
+      mutate(evaluated_as = if_else(is.na(evaluated_as), Course, evaluated_as)) %>%
+      group_by(evaluated_as) %>%
+      summarise(clearing_price = mean(Price)) %>%
+      ungroup() %>%
+      mutate(percentile = percent_rank(clearing_price))
+    , by = c("evaluated_as")
+  ) %>%
+  select(-evaluated_as) %>%
+  select(-one_of('cross_listed_as'), one_of('cross_listed_as'))
+```
+
+```{r course_benchmark}
+course_benchmark <- 
+  course_eval_cleaned %>%
+    filter(question_type == "Course") %>%
+    group_by(question_abbr) %>%
+    summarise(
+      value = mean(value)
+      , sections_evaluated = n()
+    ) %>%
+    spread(question_abbr, value) %>%
+    bind_cols(
+      clearing_prices %>%
+      filter(str_sub(Course, 1, 4) != "WHCP") %>%
+      summarise(clearing_price = mean(Price))
+    )
+```
+
+## Instructor View
+
+```{r instructor_metrics}
+instructor_metrics <- 
+  spring_2018 %>%
+  mutate(instructors = strsplit(Instructor, "/")) %>% 
+  unnest(instructors) %>%
+  mutate(instructors = str_trim(instructors)) %>%
+  filter(!(is.na(instructors) | instructors == "")) %>%
+  distinct(instructors) %>%
+  left_join(
+    course_eval_cleaned %>%
+    filter(question_type == "Instructor") %>%
+    group_by(Instructor, question_abbr) %>%
+    summarise(
+        value = mean(value)
+        , sections_evaluated = n()
+    ) %>%
+    spread(question_abbr, value)
+  , by = c('instructors' = 'Instructor')
+  ) %>%
+  arrange(instructors)
+```
+
+```{r instructor_benchmark}
+instructor_benchmark <- 
+  course_eval_cleaned %>%
+    filter(question_type == "Instructor") %>%
+    group_by(question_abbr) %>%
+    summarise(
+      value = mean(value)
+      , sections_evaluated = n()
+    ) %>%
+    spread(question_abbr, value)
+```
+
+## Export to Google Sheet
+
+We then use the [googlesheets](https://cran.r-project.org/web/packages/googlesheets/) package to add them to the [Google Sheet](https://docs.google.com/a/wharton.upenn.edu/spreadsheets/d/1kFKaK7KXlvA3zUTQvFvwZNkc7F5iZ51rKo9lC3AcXwY/edit?usp=sharing)
+
+<iframe src="https://docs.google.com/a/wharton.upenn.edu/spreadsheets/d/1kFKaK7KXlvA3zUTQvFvwZNkc7F5iZ51rKo9lC3AcXwY/pubhtml?widget=true&amp;headers=false" frameborder="0" width="800" height="650" allowfullscreen="true" mozallowfullscreen="true" webkitallowfullscreen="true"></iframe>
+
+
+```{r update_google_sheet}
+if (params$external_queries) {
+  gs <- gs_title("Analytics Club - CourseMatch Spring 2018 (File → Make a copy)")
+  
+  # Course View tab
+  gs %>% gs_edit_cells(ws = "Course View", input = course_benchmark, anchor = "K3", col_names = FALSE)
+  gs %>% gs_edit_cells(ws = "Course View", input = course_metrics, anchor = "B4", col_names = FALSE)
+  
+  # Instructor View tab
+  gs %>% gs_edit_cells(ws = "Instructor View", input = instructor_benchmark, anchor = "C3", col_names = FALSE)
+  gs %>% gs_edit_cells(ws = "Instructor View", input = instructor_metrics, anchor = "B4", col_names = FALSE)
+}
+```
+
+# Exploratory Analysis
+
+We figured we'd explore the data bit. Here are a few plots we built. To a do a real analysis, we would need response level data. In practice, we would want to built to confidence intervals to detect where the differences in response are significant before making any comparative statements. We only have the point estimate (mean) and not the standard error so we cannot do anything more sophisicated.
+
+## Evaluations by Department
+
+```{r course_summary}
+course_summary <- 
+  course_eval_cleaned %>%
+  group_by(Dept, Course, question_type, question_abbr) %>%
+  summarise(
+    value = mean(value)
+    , sections_evaluated = n()
+  )
+```
+
+```{r dept_summary}
+dept_summary <-
+  course_summary %>%
+  group_by(question_abbr) %>%
+  mutate(question_avg = sum(value * sections_evaluated)/ sum(sections_evaluated)) %>%
+  ungroup() %>%
+  group_by(Dept, question_type, question_abbr, question_avg) %>%
+  summarise(wght_avg = sum(value * sections_evaluated)/ sum(sections_evaluated)) %>%
+  ungroup() 
+```
+
+```{r fn_spline_plot}
+fn_spline_plot <- function(data) {
+  p <-
+  data %>%
+  ggplot(aes(x = fct_reorder(Dept, wght_avg) , y = wght_avg, ymin = 1, ymax = wght_avg)) +
+  facet_wrap(~question_abbr, scale = 'free_x') +
+  geom_hline(data = . %>% select(-wght_avg) %>% distinct(), aes(yintercept = question_avg),
+             linetype = "dashed", colour =  wharton_col[['wharton_red']]) +
+  geom_linerange(colour = wharton_col[['wharton_blue']]) +
+  coord_flip() +
+  labs(x = NULL, y = NULL) +
+  theme(panel.grid = element_blank()) +
+  scale_y_continuous(expand = c(0.0, 0.01), limits = c(1, 3.5)) +
+  geom_point(colour = wharton_col[['wharton_blue']]) +
+  geom_text(aes(label = scales::comma(wght_avg, digits = 3)), hjust = -0.15) +
+  geom_text(data = . %>% filter(wght_avg == min(wght_avg)), 
+            aes(x = Dept, y = question_avg, 
+                label = paste0("Avg: ",  scales::comma(wght_avg, digits = 2))), hjust = -0.05,
+            colour =  wharton_col[['wharton_red']])
+  return(ggplotGrob(p))
+}  
+```
+
+```{r dept_plots}
+dept_plots <-
+  dept_summary %>%
+  mutate(question = question_abbr) %>%
+  nest(-question_type, -question) %>%
+  mutate(plot = map(data, fn_spline_plot))
+```
+
+OIDD and REAL are consistently the top of each of the course metrics. It would be unsurprising to find that the responses to each question are correlated at the user-level.
+
+```{r course-dept-plots}
+dept_plots %>%
+  filter(question_type == "Course") %>%
+  pull(plot) %>%
+  grid.arrange(grobs = ., top = "Course Metrics", bottom = textGrob("Source: Spring 2016 to Fall 2017",
+                               gp = gpar(fontsize=10),
+                               hjust=1, x=1))
+```
+
+For instructor metrics, OIDD is again the top and STAT and BEPP are again the bottom. 
+
+```{r instructor-dept-plots, fig.width = 6, fig.height = 5.25}
+dept_plots %>%
+  filter(question_type == "Instructor") %>%
+  pull(plot) %>%
+  grid.arrange(grobs = ., top = "Instructor Metrics", 
+               bottom = textGrob("Source: Spring 2016 to Fall 2017",
+                               gp = gpar(fontsize=10),
+                               hjust=1.01, x=1))
+```    
+
+## Which course is the "best bang for your utility"?
+
+The plot below help answer what has historically been the best value (course quality) for your utility. There are many courses that have never had non-zero clearing prices.
+
+```{r course_quality_to_price}
+course_quality_to_price <-
+  course_metrics %>%
+  distinct(Course, `Course Quality`, Title, clearing_price) %>%
+  mutate(title_length = length(Title)) %>%
+  arrange(Course, title_length) %>%
+  group_by(Course) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  mutate(dept = str_sub(Course, 1, 4)) %>%
+  rename(quality = `Course Quality`) %>% 
+  filter(complete.cases(.))
+
+course_quality_to_price %>%
+  hchart("scatter", hcaes(x = clearing_price, y = quality, group = dept, course = Course,
+                          title = Title)) %>%
+  hc_tooltip(pointFormat = "<span style=\"color:{series.color}\">{point.course}</span>:{point.title}<br/>
+              Clearing Price: <b>{point.x:,.1f}</b><br/>
+              Course Quality: <b>{point.y:,.2f}</b><br/>",
+             shared = TRUE) %>%
+  hc_xAxis(title = list(text = "Average Clearing Price")) %>%
+  hc_yAxis(title = list(text = "Average Course Quality")) %>%
+  hc_title(text = 'Which course is the "best bang for your utility"?') %>%
+  hc_subtitle(text = "Value courses are in the top left corner") %>%
+  hc_credits(enabled = TRUE, text = "Source: Spring 2016 to Fall 2017") %>%
+  hc_add_theme(hc_theme_merge(
+    getOption("highcharter.theme"), 
+    hc_theme(colors = wharton_col[c('wharton_blue','wharton_red','bay_blue','morning_yellow','college_grey',
+                                    'evening_red','sunset_red','night_street','marine_grey','heritage_red')] %>% unname()))) %>%
+  hc_size(height = 700)
+```
+
+## Top 10 and Bottom 10 Instructors for Fall 2017?
+
+This list is restricted to those teaching in the fall.
+
+```{r top_bottom_instructors}
+instructor_metrics %>% 
+  arrange(desc(`Instructor Quality`)) %>%
+  mutate(
+    rnk = row_number()
+    , `Instructor Quality` = formatC(`Instructor Quality`, format = 'f', digits = 2)
+  ) %>%
+  head(10) %>%
+  select(rnk, instructors, `Instructor Quality`) %>%
+  left_join(
+    instructor_metrics %>% 
+    arrange(`Instructor Quality`) %>%
+    mutate(
+    rnk = row_number()
+    , `Instructor Quality` = formatC(`Instructor Quality`, format = 'f', digits = 2)
+    ) %>%
+    head(10) %>%
+    select(rnk, instructors, `Instructor Quality`)
+    , by = 'rnk'
+  ) %>%
+  htmlTable(
+    rnames = FALSE
+    , caption = "Top 10 and Bottom 10 Instructors for Spring 2017"
+    , align = c("clclc")
+    , col.rgroup = c("none", "#F7F7F7")
+    , cgroup = c("", "Top 10", "Bottom 10")
+    , n.cgroup = c(1,2,2)
+    , header = c("Rank", rep(c("Instructor", "Quality"), 2))
+    , css.cell = "padding-left: 2em; padding-right: 2em;"
+  ) #%>% htmltools::html_print()
+
+```
+
+## Number of Course Offerrings by Department
+
+```{r course_offerings}
+course_metrics %>%
+  mutate(dept = str_sub(Course, 1, 4)) %>%
+  group_by(dept) %>%
+  summarise(
+    Courses = n_distinct(Course)
+    , Sections = n()
+  ) %>%
+  gather(metric, value, -dept) %>%
+  hchart("column", hcaes(x = dept, y = value, group = metric)) %>%
+  hc_xAxis(title = list(text = "Department")) %>%
+  hc_yAxis(title = list(text = "Count")) %>%
+  hc_title(text = 'Do some department offer more coures?') %>%
+  hc_subtitle(text = "MGMT and FNCE dominate in number of course offerrings") %>%
+  hc_credits(enabled = TRUE, text = "Note: Cross-listing is counted for each department") %>%
+  hc_add_theme(hc_theme_merge(
+    getOption("highcharter.theme"), 
+    hc_theme(colors = wharton_col[c('wharton_blue','wharton_red')] %>% unname()))) %>%
+  hc_size(height = 600)
+```
+
