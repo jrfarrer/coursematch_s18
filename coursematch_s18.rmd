@@ -128,11 +128,7 @@ To get all the information about the Fall 2017 courses, we can use the *export* 
 
 ```{r load-all-wharton-courses}
 spring_2018_courses <- 
-  readxl::read_excel(paste0(data_path, "export_courses.xls")) #%>%
-  # For some reason, Corporate Restucturing and Distress Investing is listed as 
-  # FNCE891401 on Spike but FNCE891001 on CourseMatch - fixing this so
-  # that everything matches
-  # mutate(Section = str_replace(Section, "FNCE891401","FNCE891001"))
+  readxl::read_excel(paste0(data_path, "export_courses.xls"))
 ```
 
 ```{r show-all-wharton-courses, echo = FALSE}
